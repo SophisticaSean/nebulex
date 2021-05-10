@@ -225,9 +225,9 @@ defmodule Nebulex.Adapters.Partitioned do
   # Inherit default keyslot implementation
   use Nebulex.Adapter.Keyslot
 
+  import Nebulex.Adapter
   import Nebulex.Helpers
 
-  alias Nebulex.Adapter
   alias Nebulex.Cache.Cluster
   alias Nebulex.RPC
 
@@ -265,7 +265,7 @@ defmodule Nebulex.Adapters.Partitioned do
       A convenience function to get the node of the given `key`.
       """
       def get_node(key) do
-        Adapter.with_meta(get_dynamic_cache(), fn _adapter, %{name: name, keyslot: keyslot} ->
+        with_meta(get_dynamic_cache(), fn _adapter, %{name: name, keyslot: keyslot} ->
           Cluster.get_node(name, key, keyslot)
         end)
       end
@@ -288,21 +288,19 @@ defmodule Nebulex.Adapters.Partitioned do
 
   @impl true
   def init(opts) do
-    # Required cache name
+    # Required options
+    telemetry_prefix = Keyword.fetch!(opts, :telemetry_prefix)
     cache = Keyword.fetch!(opts, :cache)
     name = opts[:name] || cache
 
     # Maybe use stats
-    stats = Keyword.get(opts, :stats, false)
-
-    unless is_boolean(stats) do
-      raise ArgumentError, "expected stats: to be boolean, got: #{inspect(stats)}"
-    end
+    stats = get_boolean_option(opts, :stats)
 
     # Primary cache options
     primary_opts =
       opts
       |> Keyword.get(:primary, [])
+      |> Keyword.put(:telemetry_prefix, telemetry_prefix)
       |> Keyword.put_new(:stats, stats)
 
     # Maybe put a name to primary storage
@@ -322,6 +320,7 @@ defmodule Nebulex.Adapters.Partitioned do
 
     # Prepare metadata
     meta = %{
+      telemetry_prefix: telemetry_prefix,
       name: name,
       primary_name: primary_opts[:name],
       task_sup: task_sup_name,
@@ -329,6 +328,7 @@ defmodule Nebulex.Adapters.Partitioned do
       stats: stats
     }
 
+    # Prepare child_spec
     child_spec =
       Nebulex.Adapters.Supervisor.child_spec(
         name: normalize_module_name([name, Supervisor]),
@@ -371,6 +371,12 @@ defmodule Nebulex.Adapters.Partitioned do
 
   @impl true
   def get_all(adapter_meta, keys, opts) do
+    with_span(adapter_meta, :get_all, fn ->
+      do_get_all(adapter_meta, keys, opts)
+    end)
+  end
+
+  defp do_get_all(adapter_meta, keys, opts) do
     map_reduce(
       keys,
       adapter_meta,
@@ -410,11 +416,15 @@ defmodule Nebulex.Adapters.Partitioned do
 
   @impl true
   def put_all(adapter_meta, entries, _ttl, :put, opts) do
-    do_put_all(:put_all, adapter_meta, entries, opts)
+    with_span(adapter_meta, :put_all, fn ->
+      do_put_all(:put_all, adapter_meta, entries, opts)
+    end)
   end
 
   def put_all(adapter_meta, entries, _ttl, :put_new, opts) do
-    do_put_all(:put_new_all, adapter_meta, entries, opts)
+    with_span(adapter_meta, :put_new_all, fn ->
+      do_put_all(:put_new_all, adapter_meta, entries, opts)
+    end)
   end
 
   def do_put_all(action, adapter_meta, entries, opts) do
@@ -492,62 +502,93 @@ defmodule Nebulex.Adapters.Partitioned do
 
   @impl true
   def execute(%{name: name, task_sup: task_sup} = adapter_meta, operation, query, opts) do
-    reducer =
-      case operation do
-        :all -> &List.flatten/1
-        _ -> &Enum.sum/1
-      end
+    with_span(adapter_meta, operation, fn ->
+      reducer =
+        case operation do
+          :all -> &List.flatten/1
+          _ -> &Enum.sum/1
+        end
 
-    task_sup
-    |> RPC.multi_call(
-      Cluster.get_nodes(name),
-      __MODULE__,
-      :with_dynamic_cache,
-      [adapter_meta, operation, [query, opts]],
-      opts
-    )
-    |> handle_rpc_multi_call(operation, reducer)
+      task_sup
+      |> RPC.multi_call(
+        Cluster.get_nodes(name),
+        __MODULE__,
+        :with_dynamic_cache,
+        [adapter_meta, operation, [query, opts]],
+        opts
+      )
+      |> handle_rpc_multi_call(operation, reducer)
+    end)
   end
 
   @impl true
   def stream(%{name: name, task_sup: task_sup} = adapter_meta, query, opts) do
-    Stream.resource(
-      fn ->
-        Cluster.get_nodes(name)
-      end,
-      fn
-        [] ->
-          {:halt, []}
+    with_span(adapter_meta, :stream, fn ->
+      Stream.resource(
+        fn ->
+          Cluster.get_nodes(name)
+        end,
+        fn
+          [] ->
+            {:halt, []}
 
-        [node | nodes] ->
-          elements =
-            rpc_call(
-              task_sup,
-              node,
-              __MODULE__,
-              :eval_stream,
-              [adapter_meta, query, opts],
-              opts
-            )
+          [node | nodes] ->
+            elements =
+              rpc_call(
+                task_sup,
+                node,
+                __MODULE__,
+                :eval_stream,
+                [adapter_meta, query, opts],
+                opts
+              )
 
-          {elements, nodes}
-      end,
-      & &1
-    )
+            {elements, nodes}
+        end,
+        & &1
+      )
+    end)
+  end
+
+  ## Nebulex.Adapter.Persistence
+
+  @impl true
+  def dump(adapter_meta, path, opts) do
+    with_span(adapter_meta, :dump, fn ->
+      super(adapter_meta, path, opts)
+    end)
+  end
+
+  @impl true
+  def load(adapter_meta, path, opts) do
+    with_span(adapter_meta, :load, fn ->
+      super(adapter_meta, path, opts)
+    end)
   end
 
   ## Nebulex.Adapter.Transaction
 
   @impl true
   def transaction(%{name: name} = adapter_meta, opts, fun) do
-    super(adapter_meta, Keyword.put(opts, :nodes, Cluster.get_nodes(name)), fun)
+    with_span(adapter_meta, :transaction, fn ->
+      super(adapter_meta, Keyword.put(opts, :nodes, Cluster.get_nodes(name)), fun)
+    end)
+  end
+
+  @impl true
+  def in_transaction?(adapter_meta) do
+    with_span(adapter_meta, :in_transaction?, fn ->
+      super(adapter_meta)
+    end)
   end
 
   ## Nebulex.Adapter.Stats
 
   @impl true
   def stats(adapter_meta) do
-    with_dynamic_cache(adapter_meta, :stats, [])
+    with_span(adapter_meta, :stats, fn ->
+      with_dynamic_cache(adapter_meta, :stats, [])
+    end)
   end
 
   ## Helpers
@@ -581,10 +622,12 @@ defmodule Nebulex.Adapters.Partitioned do
     Cluster.get_node(name, key, keyslot)
   end
 
-  defp call(adapter_meta, key, fun, args, opts \\ []) do
-    adapter_meta
-    |> get_node(key)
-    |> rpc_call(adapter_meta, fun, args, opts)
+  defp call(adapter_meta, key, action, args, opts \\ []) do
+    with_span(adapter_meta, action, fn ->
+      adapter_meta
+      |> get_node(key)
+      |> rpc_call(adapter_meta, action, args, opts)
+    end)
   end
 
   defp rpc_call(node, %{task_sup: task_sup} = meta, fun, args, opts) do

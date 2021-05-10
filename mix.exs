@@ -2,7 +2,7 @@ defmodule Nebulex.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/cabol/nebulex"
-  @version "2.0.0"
+  @version "2.1.0-dev"
 
   def project do
     [
@@ -40,7 +40,10 @@ defmodule Nebulex.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   def application do
-    [mod: {Nebulex.Application, []}]
+    [
+      extra_applications: [:eex],
+      mod: {Nebulex.Application, []}
+    ]
   end
 
   defp deps do
